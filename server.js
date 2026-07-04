@@ -285,9 +285,11 @@ async function validateConsentAndSemaphoreProof(reqBody, preflightLabel) {
     }
 
     const expectedMessage = BigInt(
-        ethers.solidityPackedKeccak256(
-            ["uint256", "uint256", "address", "string"],
-            [BigInt(commitment), BigInt(trialId), permitRecipientAddr, "CONSENT"]
+        ethers.keccak256(
+            ethers.solidityPacked(
+                ["uint256", "address"],
+                [BigInt(commitment), permitRecipientAddr]
+            )
         )
     ).toString();
 
