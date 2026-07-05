@@ -109,6 +109,64 @@ const relayerMetrics = {
 /** trialId:nullifier → pre-signed vault register auth (from patient apply). */
 const pendingRegisterAuthStore = new Map();
 
+/** applicant (lowercase) → encrypted sponsor application manifest (AES key server-side only). */
+const sponsorApplicationStore = new Map();
+
+const SPONSOR_REGISTRY_ADDRESS =
+    process.env.SPONSOR_REGISTRY_ADDRESS?.trim() || "0xCBD45e3fC20C646CCE77F386aA60d256A78dAa23";
+
+const SPONSOR_REGISTRY_ABI = [
+    "function owner() view returns (address)",
+    "function addSponsor(address _sponsor, string _name) external",
+    "function requests(address) view returns (bytes32 encryptedInstitutionId, uint8 status, uint256 requestedAt, bool hasEncryptedData)",
+];
+
+const SPONSOR_TEST_AUTO_APPROVE_ENABLED = process.env.SPONSOR_TEST_AUTO_APPROVE_ENABLED === "true";
+const SPONSOR_REGISTRY_OWNER_PRIVATE_KEY = process.env.SPONSOR_REGISTRY_OWNER_PRIVATE_KEY?.trim();
+
+function getSponsorRegistryOwnerWallet() {
+    if (!SPONSOR_REGISTRY_OWNER_PRIVATE_KEY) return null;
+    try {
+        return new ethers.Wallet(SPONSOR_REGISTRY_OWNER_PRIVATE_KEY, provider);
+    } catch {
+        return null;
+    }
+}
+
+async function sponsorTestAutoApproveReady() {
+    if (!SPONSOR_TEST_AUTO_APPROVE_ENABLED) return false;
+    const ownerWallet = getSponsorRegistryOwnerWallet();
+    if (!ownerWallet) return false;
+    try {
+        const onChainOwner = await sponsorRegistry.owner();
+        return ownerWallet.address.toLowerCase() === onChainOwner.toLowerCase();
+    } catch {
+        return false;
+    }
+}
+
+const sponsorRegistry = new ethers.Contract(
+    SPONSOR_REGISTRY_ADDRESS,
+    SPONSOR_REGISTRY_ABI,
+    provider
+);
+
+async function assertRegistryOwnerWallet(walletHeader) {
+    const requester = typeof walletHeader === "string" ? walletHeader.trim() : "";
+    if (!requester || !ethers.isAddress(requester)) {
+        const err = new Error("Missing or invalid X-Wallet-Address header");
+        err.statusCode = 401;
+        throw err;
+    }
+    const owner = await sponsorRegistry.owner();
+    if (owner.toLowerCase() !== requester.toLowerCase()) {
+        const err = new Error("Only SponsorRegistry owner may access sponsor applications");
+        err.statusCode = 403;
+        throw err;
+    }
+    return ethers.getAddress(requester);
+}
+
 function pendingRegisterAuthKey(trialId, nullifier) {
     return `${BigInt(trialId).toString()}:${BigInt(nullifier).toString()}`;
 }
@@ -849,6 +907,125 @@ async function relayGetPendingRegisterAuth(req, res) {
     }
 }
 
+async function relayStoreSponsorApplication(req, res) {
+    try {
+        const {
+            applicant,
+            orgName,
+            docCid,
+            filename,
+            contentType,
+            sizeBytes,
+            aesKeyB64,
+            requestTxHash,
+            submittedAt,
+        } = req.body ?? {};
+        if (!applicant || !orgName || !docCid || !filename || !aesKeyB64) {
+            return res.status(400).json({ error: "Missing sponsor application fields" });
+        }
+        const addr = ethers.getAddress(applicant);
+        sponsorApplicationStore.set(addr.toLowerCase(), {
+            applicant: addr,
+            orgName: String(orgName).slice(0, 200),
+            docCid: String(docCid),
+            filename: String(filename).slice(0, 255),
+            contentType: String(contentType || "application/octet-stream"),
+            sizeBytes: Number(sizeBytes) || 0,
+            aesKeyB64: String(aesKeyB64),
+            requestTxHash: requestTxHash ? String(requestTxHash) : undefined,
+            submittedAt: Number(submittedAt) || Date.now(),
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("relay/sponsor-application failed:", safeError(err));
+        res.status(500).json({ error: safeError(err) });
+    }
+}
+
+async function relayListSponsorApplications(req, res) {
+    try {
+        await assertRegistryOwnerWallet(req.headers["x-wallet-address"]);
+        const applications = [...sponsorApplicationStore.values()].map(
+            ({ aesKeyB64: _key, ...rest }) => rest
+        );
+        res.json({ success: true, applications });
+    } catch (err) {
+        const code = err.statusCode || 500;
+        if (code >= 500) console.error("relay/sponsor-applications failed:", safeError(err));
+        res.status(code).json({ error: safeError(err) });
+    }
+}
+
+async function relayGetSponsorApplication(req, res) {
+    try {
+        await assertRegistryOwnerWallet(req.headers["x-wallet-address"]);
+        const applicant = ethers.getAddress(req.params.address);
+        const entry = sponsorApplicationStore.get(applicant.toLowerCase());
+        if (!entry) {
+            return res.status(404).json({ error: "Sponsor application not found" });
+        }
+        res.json({ success: true, application: entry });
+    } catch (err) {
+        const code = err.statusCode || 500;
+        if (code >= 500) console.error("relay/sponsor-application GET failed:", safeError(err));
+        res.status(code).json({ error: safeError(err) });
+    }
+}
+
+async function relaySponsorTestAutoApproveStatus(_req, res) {
+    try {
+        const enabled = await sponsorTestAutoApproveReady();
+        res.json({ enabled });
+    } catch (err) {
+        console.error("relay/sponsor-test-auto-approve status failed:", safeError(err));
+        res.json({ enabled: false });
+    }
+}
+
+async function relaySponsorTestAutoApprove(req, res) {
+    try {
+        if (!(await sponsorTestAutoApproveReady())) {
+            return res.status(404).json({ error: "Sponsor test auto-approve is not enabled" });
+        }
+        const { applicant, orgName } = req.body ?? {};
+        if (!applicant) {
+            return res.status(400).json({ error: "Missing applicant address" });
+        }
+        const addr = ethers.getAddress(applicant);
+        const stored = sponsorApplicationStore.get(addr.toLowerCase());
+        const name = (orgName || stored?.orgName || "").trim();
+        if (!name) {
+            return res.status(400).json({
+                error: "Missing orgName — submit a registration request with organization name first",
+            });
+        }
+
+        const ownerWallet = getSponsorRegistryOwnerWallet();
+        const registry = new ethers.Contract(
+            SPONSOR_REGISTRY_ADDRESS,
+            SPONSOR_REGISTRY_ABI,
+            ownerWallet
+        );
+        const request = await registry.requests(addr);
+        const status = Number(request.status);
+        if (status !== 1) {
+            return res.status(400).json({
+                error:
+                    status === 2
+                        ? "Sponsor is already approved"
+                        : "Submit an on-chain registration request before using test auto-approve",
+            });
+        }
+
+        const tx = await registry.addSponsor(addr, name);
+        const receipt = await tx.wait();
+        res.json({ success: true, txHash: receipt.hash, sponsor: addr, orgName: name });
+    } catch (err) {
+        console.error("relay/sponsor-test-auto-approve failed:", formatContractRevert(err));
+        res.status(500).json({ error: formatContractRevert(err) });
+    }
+}
+
 app.get("/health", async (_, res) => {
     let relayerAuthorized = null;
     try {
@@ -958,6 +1135,11 @@ app.post("/relay/claim", limiter, relayClaim);
 app.post("/relay/register-anon", limiter, relayRegisterAnon);
 app.post("/relay/store-register-auth", limiter, relayStoreRegisterAuth);
 app.get("/relay/pending-register-auth", limiter, relayGetPendingRegisterAuth);
+app.post("/relay/sponsor-application", limiter, relayStoreSponsorApplication);
+app.get("/relay/sponsor-applications", limiter, relayListSponsorApplications);
+app.get("/relay/sponsor-application/:address", limiter, relayGetSponsorApplication);
+app.get("/relay/sponsor-test-auto-approve", limiter, relaySponsorTestAutoApproveStatus);
+app.post("/relay/sponsor-test-auto-approve", limiter, relaySponsorTestAutoApprove);
 app.post("/relay/completion-proof", limiter, relayCompletionProof);
 app.post("/relay/public-exit", limiter, relayPublicExit);
 
