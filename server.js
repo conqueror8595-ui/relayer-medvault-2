@@ -134,15 +134,52 @@ function getSponsorRegistryOwnerWallet() {
 }
 
 async function sponsorTestAutoApproveReady() {
-    if (!SPONSOR_TEST_AUTO_APPROVE_ENABLED) return false;
+    const diag = await getSponsorTestAutoApproveDiagnostics();
+    return diag.enabled;
+}
+
+/** Safe status for GET /relay/sponsor-test-auto-approve (no secrets). */
+async function getSponsorTestAutoApproveDiagnostics() {
+    const rawFlag = process.env.SPONSOR_TEST_AUTO_APPROVE_ENABLED?.trim() ?? "";
+    const flagEnabled = SPONSOR_TEST_AUTO_APPROVE_ENABLED;
+    const ownerKeyConfigured = Boolean(SPONSOR_REGISTRY_OWNER_PRIVATE_KEY);
     const ownerWallet = getSponsorRegistryOwnerWallet();
-    if (!ownerWallet) return false;
+    const ownerKeyValid = Boolean(ownerWallet);
+    let registryOwner = null;
+    let ownerKeyMatchesRegistry = false;
     try {
-        const onChainOwner = await sponsorRegistry.owner();
-        return ownerWallet.address.toLowerCase() === onChainOwner.toLowerCase();
+        registryOwner = await sponsorRegistry.owner();
+        if (ownerWallet && registryOwner) {
+            ownerKeyMatchesRegistry =
+                ownerWallet.address.toLowerCase() === registryOwner.toLowerCase();
+        }
     } catch {
-        return false;
+        registryOwner = null;
     }
+    const enabled = flagEnabled && ownerKeyValid && ownerKeyMatchesRegistry;
+    let reason = null;
+    if (!enabled) {
+        if (!rawFlag) reason = "missing_SPONSOR_TEST_AUTO_APPROVE_ENABLED";
+        else if (rawFlag !== "true") reason = "SPONSOR_TEST_AUTO_APPROVE_ENABLED_must_be_exactly_true";
+        else if (!ownerKeyConfigured) reason = "missing_SPONSOR_REGISTRY_OWNER_PRIVATE_KEY";
+        else if (!ownerKeyValid) reason = "invalid_SPONSOR_REGISTRY_OWNER_PRIVATE_KEY";
+        else if (!ownerKeyMatchesRegistry) reason = "owner_key_does_not_match_SponsorRegistry_owner";
+        else reason = "unknown";
+    }
+    return {
+        enabled,
+        reason,
+        checks: {
+            flagEnabled,
+            flagRaw: rawFlag || null,
+            ownerKeyConfigured,
+            ownerKeyValid,
+            ownerKeyMatchesRegistry,
+            configuredOwnerAddress: ownerWallet?.address ?? null,
+            registryOwner,
+            sponsorRegistryAddress: SPONSOR_REGISTRY_ADDRESS,
+        },
+    };
 }
 
 const sponsorRegistry = new ethers.Contract(
@@ -974,11 +1011,11 @@ async function relayGetSponsorApplication(req, res) {
 
 async function relaySponsorTestAutoApproveStatus(_req, res) {
     try {
-        const enabled = await sponsorTestAutoApproveReady();
-        res.json({ enabled });
+        const diag = await getSponsorTestAutoApproveDiagnostics();
+        res.json(diag);
     } catch (err) {
         console.error("relay/sponsor-test-auto-approve status failed:", safeError(err));
-        res.json({ enabled: false });
+        res.json({ enabled: false, reason: "status_check_failed" });
     }
 }
 
