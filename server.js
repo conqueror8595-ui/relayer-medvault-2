@@ -106,6 +106,13 @@ const relayerMetrics = {
     finalizeSuccess: 0,
 };
 
+/** trialId:nullifier → pre-signed vault register auth (from patient apply). */
+const pendingRegisterAuthStore = new Map();
+
+function pendingRegisterAuthKey(trialId, nullifier) {
+    return `${BigInt(trialId).toString()}:${BigInt(nullifier).toString()}`;
+}
+
 const REGISTRY_ABI = [
     "function stageAnonymousApply(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, uint256 deadline, bytes permitSignature) external",
     "function finalizeAnonymousApplyWithProof(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, address consentWallet, uint256 deadline, bytes permitSignature, bytes consentWalletSignature, bytes noirProof, bytes32[] publicInputs) external",
@@ -794,6 +801,54 @@ async function relayRegisterAnon(req, res) {
     }
 }
 
+async function relayStoreRegisterAuth(req, res) {
+    try {
+        const { trialId, nullifier, permitHolder, nonce, deadline, signature, vaultAddress } = req.body ?? {};
+        if (
+            trialId === undefined ||
+            nullifier === undefined ||
+            !permitHolder ||
+            nonce === undefined ||
+            deadline === undefined ||
+            !signature
+        ) {
+            return res.status(400).json({ error: "Missing store-register-auth fields" });
+        }
+        const key = pendingRegisterAuthKey(trialId, nullifier);
+        pendingRegisterAuthStore.set(key, {
+            trialId: BigInt(trialId).toString(),
+            nullifier: BigInt(nullifier).toString(),
+            permitHolder: ethers.getAddress(permitHolder),
+            nonce: BigInt(nonce).toString(),
+            deadline: BigInt(deadline).toString(),
+            signature,
+            vaultAddress: vaultAddress ? ethers.getAddress(vaultAddress) : SPONSOR_INCENTIVE_VAULT_ADDRESS,
+            storedAt: Date.now(),
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("relay/store-register-auth failed:", safeError(err));
+        res.status(500).json({ error: safeError(err) });
+    }
+}
+
+async function relayGetPendingRegisterAuth(req, res) {
+    try {
+        const { trialId, nullifier } = req.query ?? {};
+        if (trialId === undefined || nullifier === undefined) {
+            return res.status(400).json({ error: "Missing trialId or nullifier" });
+        }
+        const entry = pendingRegisterAuthStore.get(pendingRegisterAuthKey(trialId, nullifier));
+        if (!entry) {
+            return res.status(404).json({ error: "Pending register auth not found" });
+        }
+        res.json({ success: true, auth: entry });
+    } catch (err) {
+        console.error("relay/pending-register-auth failed:", safeError(err));
+        res.status(500).json({ error: safeError(err) });
+    }
+}
+
 app.get("/health", async (_, res) => {
     let relayerAuthorized = null;
     try {
@@ -901,6 +956,8 @@ app.post("/relay/cancel-stage", limiter, relayCancelStage);
 app.post("/relay/register", limiter, relayRegister);
 app.post("/relay/claim", limiter, relayClaim);
 app.post("/relay/register-anon", limiter, relayRegisterAnon);
+app.post("/relay/store-register-auth", limiter, relayStoreRegisterAuth);
+app.get("/relay/pending-register-auth", limiter, relayGetPendingRegisterAuth);
 app.post("/relay/completion-proof", limiter, relayCompletionProof);
 app.post("/relay/public-exit", limiter, relayPublicExit);
 
