@@ -95,8 +95,8 @@ Validates Semaphore proof + consent message binding, then calls `registry.stageA
 
 **Gasless finalize path** — authorized relayer submits `finalizeAnonymousApplyWithProof` on behalf of the patient.
 
-- **P0.2 path:** when `permitRecipient` is the relayer wallet, relayer user-decrypts staged `finalCt` and **ignores** client-supplied `eligible`. Rejects decrypt=false with `code: "NOT_ELIGIBLE"`.
-- **Ephemeral path:** when `permitRecipient` is the patient's ephemeral viewing key, client decrypts locally and supplies a Noir proof; relayer submits without re-decrypt (client `eligible: false` is rejected at HTTP layer).
+- **Default path (patient-decrypt browser):** when `permitRecipient` is the patient's ephemeral viewing key, client decrypts locally and supplies a Noir proof; relayer submits without re-decrypt (client `eligible: false` is rejected at HTTP layer). **Recommended and used by production UI.**
+- **P0.2 path (optional relayer-assisted):** when `permitRecipient` is the relayer wallet, relayer user-decrypts staged `finalCt` and **ignores** client-supplied `eligible`. Rejects decrypt=false with `code: "NOT_ELIGIBLE"`. Requires `acknowledgeRelayerVisibility: true`. **Relayer learns the eligibility bit** — defense-in-depth only; do not use in main judge demo unless explaining the tradeoff.
 
 Patient EOAs **cannot** call `finalizeAnonymousApplyWithProof` directly on-chain (HIGH-1 / `onlyAuthorizedRelayer`).
 
@@ -206,7 +206,7 @@ Uses Pinata `pinFileToIPFS`. Credentials resolve in order:
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `RELAYER_PRIVATE_KEY` | **Yes** | Hot wallet paying gas; must match `MedVaultRegistry.trustedRelayer` |
+| `RELAYER_PRIVATE_KEY` | **Yes** | Hot wallet paying gas; must be in `MedVaultRegistry.authorizedRelayers` |
 | `REGISTRY_ADDRESS` | **Yes** | `AnonymousPatientRegistry` / MedVault registry |
 | `SEMAPHORE_ADDRESS` | **Yes** | Must match `registry.semaphore()` |
 | `RPC_URL` | No | Sepolia RPC (fallback chain below) |
@@ -270,11 +270,15 @@ Failure exits with code `1`.
 - IPFS payloads, Noir witness plaintext
 - Email / phone / SSN patterns (redacted if present in error strings)
 
-### P0.2 eligibility decrypt (interim)
+### P0.2 relayer-assisted decrypt (optional defense-in-depth)
 
-- Relayer is `permitRecipient` from `stageAnonymousApply`
+**Not the default.** Production UI uses patient-decrypt (browser) with ephemeral `permitRecipient`.
+
+Optional mode when relayer is `permitRecipient` from `stageAnonymousApply`:
 - User-decrypt via `@zama-fhe/sdk` (`permits.grantPermit` + `decryption.decryptValues`)
 - Result cached per `(nullifier, trialId)` for `STAGING_TTL` (7 days); invalidated on cancel
+- Requires `acknowledgeRelayerVisibility: true` on `/relay/apply-finalize`
+- **Visibility tradeoff:** relayer learns the plaintext eligibility bit — improves server-side verification but costs patient privacy against the relayer
 - **Structural fix (P2) shipped:** `FHE.select` payout gating — see [SECURITY.md](../SECURITY.md) and [docs/formal-verification/certora-halmos-results.md](../docs/formal-verification/certora-halmos-results.md)
 
 ### P3.1 multi-relayer allowlist
@@ -291,4 +295,5 @@ Failure exits with code `1`.
 
 ### P3.3 threshold decrypt committee (deferred)
 
-- **Not implemented** — 2-of-3 relayer co-sign finalize after independent decrypt is deferred until an institutional pilot requires it
+- **Not implemented** — M-of-N relayer co-sign finalize after independent decrypt is deferred until an institutional pilot requires it
+- **Visibility caveat:** each co-signing relayer still decrypts and sees the eligibility bit — P3.3 is agreement, not confidentiality against relayers
