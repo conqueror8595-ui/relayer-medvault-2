@@ -23,6 +23,7 @@ import {
     getRelayerEligible,
     invalidateEligibilityCaches,
     resolveStagedFinalCt,
+    assertRelayerVisibilityAcknowledged,
 } from "./eligibility-decrypt.mjs";
 import { safeError, safeLog } from "./redaction.mjs";
 import { startV09Watcher } from "./watcher.mjs";
@@ -212,7 +213,8 @@ const REGISTRY_ABI = [
     "function stageAnonymousApply(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, uint256 deadline, bytes permitSignature) external",
     "function finalizeAnonymousApplyWithProof(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, address consentWallet, uint256 deadline, bytes permitSignature, bytes consentWalletSignature, bytes noirProof, bytes32[] publicInputs) external",
     "function cancelAnonymousApplyStage(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, uint256 deadline, bytes permitSignature, bytes cancelSignature) external",
-    "function registerPatientViaRelayer(address patientWallet, uint256 identityCommitment, address viewPermitRecipient, bytes32 profileCommitment, bytes32 profileSaltCommitment, bytes ageHandle, bytes genderHandle, bytes weightHandle, bytes heightHandle, bytes diabetesHandle, bytes hbHandle, bytes smokerHandle, bytes hypertensionHandle, bytes inputProof, uint256 nonce, bytes signature) external",
+    "function registerPatientViaRelayer(address patientWallet, uint256 identityCommitment, address viewPermitRecipient, bytes32 profileCommitment, bytes32 profileSaltCommitment, bytes ageHandle, bytes genderHandle, bytes weightHandle, bytes heightHandle, bytes diabetesHandle, bytes hbHandle, bytes smokerHandle, bytes hypertensionHandle, bytes inputProof, uint256 nonce, uint256 deadline, bytes signature) external",
+    "function computeHealthDataHash(bytes32 ageHandle, bytes32 genderHandle, bytes32 weightHandle, bytes32 heightHandle, bytes32 diabetesHandle, bytes32 hbHandle, bytes32 smokerHandle, bytes32 hypertensionHandle, bytes inputProof) external pure returns (bytes32)",
     "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
     "function patientGroupId() external view returns (uint256)",
     "function eligibilityEngine() external view returns (address)",
@@ -507,7 +509,7 @@ async function relayFinalize(req, res) {
     relayerMetrics.finalizeAttempts += 1;
 
     try {
-        const { noirProof, publicInputs, eligible, consentWallet, deadline, permitSignature, consentWalletSignature } =
+        const { noirProof, publicInputs, eligible, consentWallet, deadline, permitSignature, consentWalletSignature, acknowledgeRelayerVisibility } =
             req.body;
         if (!noirProof || !Array.isArray(publicInputs)) {
             return res.status(400).json({
@@ -533,6 +535,18 @@ async function relayFinalize(req, res) {
 
         // P0.2: independent re-decrypt only when relayer is the staged permit holder.
         if (relayerIsPermitHolder) {
+            try {
+                assertRelayerVisibilityAcknowledged({
+                    relayerIsPermitHolder: true,
+                    acknowledged: acknowledgeRelayerVisibility === true,
+                });
+            } catch (ackErr) {
+                return res.status(400).json({
+                    error: ackErr.message ?? "Relayer-assisted decrypt requires acknowledgeRelayerVisibility=true",
+                    code: ackErr.code ?? "RELAYER_VISIBILITY_NOT_ACKNOWLEDGED",
+                });
+            }
+
             let staged;
             try {
                 staged = resolveStagedFinalCt({
@@ -659,11 +673,24 @@ async function relayCompletionProof(req, res) {
         verifyCompletionProofAuth({ kind, user, handle, stageTxHash, callerSignature });
 
         const result = await watcher.lookupCompletionProof({ kind, user, handle, stageTxHash });
+        let completeTxHash;
+        if (kind === "withdrawTo" && result.transferable) {
+            try {
+                completeTxHash = await watcher.completeWithdrawTo(user, result.cleartexts, result.proof);
+                safeLog("completion-proof auto-completeWithdrawTo:", completeTxHash);
+            } catch (completeErr) {
+                const reason = extractErrorMessage(completeErr);
+                if (!/nothing pending|already/i.test(reason)) {
+                    safeError("completion-proof auto-complete failed:", reason);
+                }
+            }
+        }
         res.json({
             success: true,
             eligible: result.eligible,
             cleartexts: result.cleartexts,
             decryptionProof: result.proof,
+            completeTxHash: completeTxHash ?? null,
         });
     } catch (err) {
         res.status(400).json({ error: extractErrorMessage(err) });
@@ -750,7 +777,9 @@ async function relayRegister(req, res) {
             profileSaltCommitment,
             encryptedFields,
             inputProof,
+            healthDataHash,
             nonce,
+            deadline,
             signature,
         } = req.body;
 
@@ -762,14 +791,51 @@ async function relayRegister(req, res) {
             !profileSaltCommitment ||
             !encryptedFields ||
             !inputProof ||
+            !healthDataHash ||
             nonce === undefined ||
+            deadline === undefined ||
             !signature
         ) {
-            return res.status(400).json({ error: "Missing registration fields (profileSaltCommitment required)" });
+            return res.status(400).json({ error: "Missing registration fields (profileSaltCommitment, healthDataHash, deadline required)" });
         }
         if (!ethers.isAddress(patientWallet) || !ethers.isAddress(viewPermitRecipient)) {
             return res.status(400).json({ error: "Invalid address" });
         }
+
+        const computedHash = await registry.computeHealthDataHash(
+            encryptedFields.age,
+            encryptedFields.gender,
+            encryptedFields.weight,
+            encryptedFields.height,
+            encryptedFields.hasDiabetes,
+            encryptedFields.hbLevel,
+            encryptedFields.isSmoker,
+            encryptedFields.hasHypertension,
+            inputProof
+        );
+        if (computedHash !== healthDataHash) {
+            return res.status(400).json({ error: "healthDataHash mismatch: encrypted vitals bundle is inconsistent" });
+        }
+
+        await registry.registerPatientViaRelayer.staticCall(
+            ethers.getAddress(patientWallet),
+            BigInt(identityCommitment),
+            ethers.getAddress(viewPermitRecipient),
+            profileCommitment,
+            profileSaltCommitment,
+            encryptedFields.age,
+            encryptedFields.gender,
+            encryptedFields.weight,
+            encryptedFields.height,
+            encryptedFields.hasDiabetes,
+            encryptedFields.hbLevel,
+            encryptedFields.isSmoker,
+            encryptedFields.hasHypertension,
+            inputProof,
+            BigInt(nonce),
+            BigInt(deadline),
+            signature
+        );
 
         const tx = await registry.registerPatientViaRelayer(
             ethers.getAddress(patientWallet),
@@ -787,6 +853,7 @@ async function relayRegister(req, res) {
             encryptedFields.hasHypertension,
             inputProof,
             BigInt(nonce),
+            BigInt(deadline),
             signature
         );
         const receipt = await tx.wait();
@@ -1056,6 +1123,7 @@ async function relaySponsorTestAutoApprove(req, res) {
 
         const tx = await registry.addSponsor(addr, name);
         const receipt = await tx.wait();
+        sponsorApplicationStore.delete(addr.toLowerCase());
         res.json({ success: true, txHash: receipt.hash, sponsor: addr, orgName: name });
     } catch (err) {
         console.error("relay/sponsor-test-auto-approve failed:", formatContractRevert(err));
@@ -1094,7 +1162,8 @@ app.get("/transparency", async (_, res) => {
         relayerAuthorized,
         relayerGovernance: "P3.1 authorizedRelayers + 6-hour timelock (scheduleRelayerAuth / applyRelayerAuth)",
         finalizeGate: "HIGH-1: finalizeAnonymousApplyWithProof requires onlyAuthorizedRelayer; payout forgery blocked by FHE.select (P2)",
-        p02DecryptPath: "When permitRecipient == relayerWallet, /relay/apply-finalize re-decrypts staged finalCt (ignores client eligible)",
+        defaultDecryptPath: "Patient-decrypt (browser) — recommended default; relayer never sees the eligibility bit",
+        p02DecryptPath: "Optional defense-in-depth: when permitRecipient == relayerWallet, relayer independently re-decrypts (improves server-side verification, but the relayer learns the eligibility bit). Not used by the production UI. Requires acknowledgeRelayerVisibility=true.",
         ephemeralDecryptPath: "When permitRecipient is patient ephemeral, relayer submits gaslessly after client Noir proof (no relayer re-decrypt)",
         committeeMode: "P3.1-dual-independent",
         thresholdTarget: "2-of-2 (spec only — see docs/P3_3_THRESHOLD_ATTESTATION.md)",
@@ -1128,6 +1197,8 @@ app.get("/transparency", async (_, res) => {
                 "email/phone/SSN patterns",
             ],
         },
+        publicMetadataReminder:
+            "trialId and nullifier are public on-chain regardless of relayer logging policy",
         eligibilityDecrypt: {
             interimMitigation: "P0.2 defense-in-depth",
             structuralFix: "P2 FHE.select payout gating (shipped)",
@@ -1192,7 +1263,7 @@ const WATCHER_ENABLED = process.env.WATCHER_ENABLED !== "false";
 
 runStartupChecks()
     .then(async () => {
-        if (WATCHER_ENABLED) {
+        if (CONFIDENTIAL_ETH_ADDRESS) {
             watcher = startV09Watcher({
                 provider,
                 relayerWallet,
@@ -1201,9 +1272,15 @@ runStartupChecks()
                 stakingManagerAddress: STAKING_MANAGER_ADDRESS,
                 pollMs: Number(process.env.WATCHER_POLL_MS || 15_000),
             });
-            await watcher.start();
+            if (WATCHER_ENABLED) {
+                await watcher.start();
+            } else {
+                console.log(
+                    "Watcher polling disabled (WATCHER_ENABLED=false) — on-demand /relay/completion-proof only"
+                );
+            }
         } else {
-            console.log("Watcher disabled (WATCHER_ENABLED=false)");
+            console.warn("CONFIDENTIAL_ETH_ADDRESS unset — withdraw-to completion disabled");
         }
 
         app.listen(PORT, () => console.log(`MedVault relayer listening on port ${PORT}`));
