@@ -27,6 +27,7 @@ import {
 } from "./eligibility-decrypt.mjs";
 import { safeError, safeLog } from "./redaction.mjs";
 import { startV09Watcher } from "./watcher.mjs";
+import { createWithdrawCompleter } from "./withdraw-completion.mjs";
 import { createRequire } from "module";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -246,6 +247,9 @@ let zamaSdk = null;
 let eligibilityEngineAddress = ELIGIBILITY_ENGINE_ADDRESS ?? null;
 /** @type {ReturnType<typeof startV09Watcher> | null} */
 let watcher = null;
+
+/** Relayer-paid completeWithdrawTo — not tied to watcher instance shape. */
+const completeWithdrawToOnChain = createWithdrawCompleter(relayerWallet, CONFIDENTIAL_ETH_ADDRESS);
 
 function toBigInt(value, fieldName) {
     try {
@@ -674,14 +678,24 @@ async function relayCompletionProof(req, res) {
 
         const result = await watcher.lookupCompletionProof({ kind, user, handle, stageTxHash });
         let completeTxHash;
-        if (kind === "withdrawTo" && result.transferable) {
-            try {
-                completeTxHash = await watcher.completeWithdrawTo(user, result.cleartexts, result.proof);
-                safeLog("completion-proof auto-completeWithdrawTo:", completeTxHash);
-            } catch (completeErr) {
-                const reason = extractErrorMessage(completeErr);
-                if (!/nothing pending|already/i.test(reason)) {
-                    safeError("completion-proof auto-complete failed:", reason);
+        let completeError;
+        if (kind === "withdrawTo") {
+            if (!completeWithdrawToOnChain) {
+                completeError = "ConfidentialETH not configured on relayer";
+            } else {
+                try {
+                    completeTxHash = await completeWithdrawToOnChain(
+                        user,
+                        result.cleartexts,
+                        result.proof,
+                    );
+                    safeLog("completion-proof auto-completeWithdrawTo:", completeTxHash);
+                } catch (completeErr) {
+                    const reason = extractErrorMessage(completeErr);
+                    if (!/nothing pending|already/i.test(reason)) {
+                        completeError = reason;
+                        safeError("completion-proof auto-complete failed:", reason);
+                    }
                 }
             }
         }
@@ -691,6 +705,7 @@ async function relayCompletionProof(req, res) {
             cleartexts: result.cleartexts,
             decryptionProof: result.proof,
             completeTxHash: completeTxHash ?? null,
+            completeError: completeError ?? null,
         });
     } catch (err) {
         res.status(400).json({ error: extractErrorMessage(err) });
